@@ -54,6 +54,7 @@
 #include <linux/kernel.h>
 #include <linux/blkdev.h>
 #include <linux/err.h>
+#include <linux/mutex.h>
 #include <linux/parport.h>
 #include <linux/delay.h>
 #include <linux/errno.h>
@@ -117,6 +118,12 @@ struct avatar250_dev {
 	struct pardevice *pdev;
 	struct gendisk *disk;
 	sector_t capacity;   /* in 512-byte sectors */
+	struct mutex io_lock; /* serializes all hardware access - submit_bio
+				* has no other serialization, and the kernel's
+				* async writeback path can and does submit
+				* multiple bios concurrently. A mutex (not a
+				* spinlock) because avatar250_wait_status() can
+				* sleep via msleep()/usleep_range(). */
 };
 
 /* Single-instance driver: one drive, one global device. attach()/detach()
@@ -366,6 +373,17 @@ static void avatar250_submit_bio(struct bio *bio)
 	int write = bio_data_dir(bio) == WRITE;
 	int ret = 0;
 
+	/* Only serialization in this driver - without it, concurrent bios
+	 * (routine under the kernel's async writeback path, which is what
+	 * "lost async page write" in dmesg was actually telling us) could
+	 * enter this function from multiple contexts at once and interleave
+	 * raw register accesses to the same physical parallel port,
+	 * corrupting the ATA command sequence mid-transfer. That produces
+	 * exactly the failure pattern seen during bring-up: deterministic-
+	 * looking but position-independent write failures, immune to cable
+	 * or media quality, because the actual cause was never hardware. */
+	mutex_lock(&dev->io_lock);
+
 	bio_for_each_segment(bvec, bio, iter) {
 		void *p = bvec_kmap_local(&bvec);
 		unsigned int len = bvec.bv_len;
@@ -393,6 +411,8 @@ static void avatar250_submit_bio(struct bio *bio)
 		if (ret < 0)
 			break;
 	}
+
+	mutex_unlock(&dev->io_lock);
 
 	bio->bi_status = ret < 0 ? BLK_STS_IOERR : BLK_STS_OK;
 	bio_endio(bio);
@@ -432,6 +452,7 @@ static void avatar250_attach(struct parport *port)
 	if (!g_dev)
 		return;
 	g_dev->port = port;
+	mutex_init(&g_dev->io_lock);
 
 	memset(&cb, 0, sizeof(cb));
 	cb.private = g_dev;
